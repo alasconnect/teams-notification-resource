@@ -1,55 +1,75 @@
-#!/usr/bin/env bash
-
-CURL_OPTION="-v"
+#!/bin/bash
 
 set -e
+
+cd "${1}"
+
 exec 3>&1
 exec 1>&2
-#set -x
-
-function evaluate {
-  __var=$1
-  # escape ( and ) from markdown
-  __var="${__var//\(/\\(}"
-  __var="${__var//\)/\\)}"
-  __var="${__var//\:/\\:}"
-  __var=`eval echo $__var`
-  echo $__var
-}
+set +x
 
 payload=$(mktemp /tmp/resource-in.XXXXXX)
 cat > "${payload}" <&0
 
-format="markdown"
-color="$(jq -r '.params.color // "00EA43"' < "${payload}")"
-
-actionName=$(evaluate "$(jq -r '.params.actionName // "Open Concourse"' < "${payload}")")
-
-actionTarget=$(evaluate "$(jq -r '.params.actionTarget // "https://concourse.ci"' < "${payload}")")
-
-title=$(evaluate "$(jq -r '.params.title // "Concourse CI"' < "${payload}")")
-
-text=$(evaluate "$(jq -r '.params.text // "NO MSG"' < "${payload}")")
-
-body="{\"TextFormat\": \"${format}\", \"text\": \"${text}\", \"title\": \"${title}\", \"potentialAction\": [{\"@context\": \"https://schema.org\", \"@type\": \"ViewAction\", \"name\": \"${actionName}\", \"target\": [\"${actionTarget}\"]}]}"
+# Parameters
+timestamp="$(jq -n "{version:{timestamp:\"$(date +%s)\"}}")"
 
 webhook_url="$(jq -r '.source.url' < "${payload}")"
-redacted_webhook_url=$(echo "${webhook_url}" | sed -e 's#/\([^/\.]\{2\}\)[^/.]\{5,\}\([^/.]\{2\}\)#/\1…\2#g' | jq -R .)
 
-url_path="$(echo ${webhook_url} | sed -e "s/https\{0,1\}:\/\/[^\/]*\(\/[^?&#]*\).*/\1/")"
-curl ${CURL_OPTION} -d "${body}" "${webhook_url}" 2>&1 | sed -e "s#${url_path}#***WEBHOOK URL REDACTED***#g"
+title="$(jq -r '.params.title // "Concourse CI"' < "${payload}")"
+text="$(jq -r '.params.text // "_(missing notification text)_"' < "${payload}")"
+text_format="markdown"
 
-timestamp=$(date +%s)
-metadata="$(cat <<EOF
+action_name="$(jq -r '.params.action_name // "Open Concourse"' < "${payload}")"
+action_target="$(jq -r '.params.action_target // "https://concourse.ci"' < "${payload}")"
+
+# Set Body
+CURL_OPTION="-v"
+
+text_interpolated=$(echo -n "$text" | envsubst | jq -R -s .)
+title_interpolated="$(echo -n "${title}" | envsubst | jq -R -s .)"
+text_format_interpolated="$(eval "printf ${text_format}" | jq -R -s .)"
+action_name_interpolated="$(echo -n "${action_name}" | envsubst | jq -R -s .)"
+action_target_interpolated="$(eval "printf ${action_target}" | jq -R -s .)"
+
+body="$(cat <<EOF
 {
-  "version": {"timestamp": "${timestamp}"},
-  "metadata": [
-    {"name": "url", "value": ${redacted_webhook_url}},
-    {"name": "BUILD_PIPELINE_NAME", "value": "${BUILD_PIPELINE_NAME}"}
+  "Title": ${title_interpolated},
+  "Text": ${text_interpolated},
+  "TextFormat": ${text_format_interpolated},
+  "potentialAction": [
+    {
+      "@context": "https://schema.org",
+      "@type": "ViewAction",
+      "name": ${action_name_interpolated},
+      "target": [
+        ${action_target_interpolated}
+      ]
+    }
   ]
 }
 EOF
 )"
 
-echo "$metadata"  >&3
+compact_body="$(echo "${body}" | jq -c '.')"
 
+# Send
+redacted_webhook_url=$(echo "${webhook_url}" | sed -e 's#/\([^/\.]\{2\}\)[^/.]\{5,\}\([^/.]\{2\}\)#/\1…\2#g' | jq -R .)
+url_path="$(echo ${webhook_url} | sed -e "s/https\{0,1\}:\/\/[^\/]*\(\/[^?&#]*\).*/\1/")"
+
+curl ${CURL_OPTION} -d "${compact_body}" "${webhook_url}" 2>&1 | sed -e "s#${url_path}#***WEBHOOK URL REDACTED***#g"
+
+metadata="$(cat <<EOF
+{
+  "metadata": [
+    {"name": "url", "value": ${redacted_webhook_url}                  },
+    {"name": "title", "value": ${title_interpolated}                  },
+    {"name": "text", "value": ${text_interpolated}                    },
+    {"name": "action_name", "value": ${action_name_interpolated}      },
+    {"name": "action_target", "value": ${action_target_interpolated}  }
+  ]
+}
+EOF
+)"
+
+echo "$timestamp $metadata " | jq -s add  >&3
